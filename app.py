@@ -1,612 +1,328 @@
-"""
-NITI Aayog Anemia Screening Portal
-----------------------------------
-A Streamlit front-end for the XGBoost anemia-risk model trained in
-CDAC_Project_Trial3_for_aspirational_districts.ipynb.
-
-Run with:
-    streamlit run app.py
-"""
-
 import os
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+for env_var in ["OPENBLAS", "OMP", "MKL", "VECLIB_MAXIMUM", "NUMEXPR_NUM"]:
+    os.environ[f"{env_var}_THREADS"] = "1"
 
-import importlib.metadata as _md
 from pathlib import Path
-from typing import Optional
-
 import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import xgboost as xgb
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 
 # ==========================================================
-# 0. Paths (resolved relative to THIS file, not the shell's
-#    current working directory -- fixes the most common
-#    "model file not found" crash when the app is launched
-#    from a different folder than app.py lives in)
+# 0. Paths & Theme Config
 # ==========================================================
 APP_DIR = Path(__file__).resolve().parent
-REPO_ROOT = APP_DIR.parent if APP_DIR.name == "src" else APP_DIR # Adjust if your structure differs
+MODELS_DIR, DATA_DIR = APP_DIR / "models", APP_DIR / "data"
 
+st.set_page_config(page_title="Anemia Risk Predictor", page_icon="🩸", layout="wide")
+PRIMARY, RISK_HIGH, RISK_LOW, TEXT_MUTED = "#0F5257", "#C8483C", "#2F8F6E", "#5C6B6E"
 
-def _find_latest(pattern: str) -> "Optional[Path]":
-    """Return the most recently-dated file in APP_DIR matching `pattern`.
-
-    The training notebook stamps model/feature exports with the date they
-    were generated (e.g. `xgboost_anemia_optimized_20260729.pkl`), so the
-    exact filename changes on every retrain. YYYYMMDD sorts correctly as
-    plain text, so picking the lexicographically-last match reliably picks
-    the newest export without app.py needing to hardcode a date.
-    """
-    matches = sorted(APP_DIR.glob(pattern))
-    return matches[-1] if matches else None
-
-
-JSON_MODEL_PATH = APP_DIR / "xgboost_anemia_model.json"  # not date-stamped by the notebook
-PKL_MODEL_PATH = _find_latest("xgboost_anemia_optimized_*.pkl")
-
-# ==========================================================
-# 1. Page configuration & visual theme
-# ==========================================================
-st.set_page_config(
-    page_title="NITI Aayog Anemia Screening Portal",
-    page_icon="🩸",
-    layout="wide",
-)
-
-PRIMARY = "#0F5257"      # deep teal - headers, primary UI accents
-PRIMARY_DARK = "#0B3D40"
-RISK_HIGH = "#C8483C"    # clinical coral-red - positive screen
-RISK_LOW = "#2F8F6E"     # grounded green - clear screen
-BG_SOFT = "#F5F8F8"
-TEXT_MUTED = "#5C6B6E"
-
-st.markdown(
-    f"""
+st.markdown(f"""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Lora:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-
-    h1, h2, h3 {{
-        font-family: 'Lora', serif !important;
-    }}
-    .block-container {{
-        padding-top: 2rem;
-    }}
-    .risk-banner {{
-        padding: 1.1rem 1.4rem;
-        border-radius: 10px;
-        font-size: 1.05rem;
-        font-weight: 600;
-        margin-bottom: 0.6rem;
-    }}
-    .risk-banner.high {{
-        background-color: #FBEAEA;
-        color: {RISK_HIGH};
-        border: 1px solid {RISK_HIGH}55;
-    }}
-    .risk-banner.low {{
-        background-color: #E9F5F0;
-        color: {RISK_LOW};
-        border: 1px solid {RISK_LOW}55;
-    }}
-    .card {{
-        background: white;
-        border: 1px solid #E4EAEA;
-        border-radius: 12px;
-        padding: 1.1rem 1.3rem;
-        margin-bottom: 0.9rem;
-    }}
-    .muted {{
-        color: {TEXT_MUTED};
-        font-size: 0.88rem;
-    }}
-    .disclaimer {{
-        background-color: #FFF8E8;
-        border: 1px solid #F0DFA6;
-        border-radius: 8px;
-        padding: 0.8rem 1.1rem;
-        font-size: 0.86rem;
-        color: #6B5A17;
-        margin-top: 1.4rem;
-    }}
+    @import url('https://fonts.googleapis.com/css2?family=Lora:wght@500;700&family=Inter:wght@400;600&display=swap');
+    h1, h2, h3 {{ font-family: 'Lora', serif !important; }}
+    .block-container {{ padding-top: 2rem; }}
+    .risk-banner {{ padding: 1.1rem; border-radius: 10px; font-size: 1.05rem; font-weight: 600; margin-bottom: 0.6rem; text-align: center; }}
+    .high {{ background: #FBEAEA; color: {RISK_HIGH}; border: 1px solid {RISK_HIGH}55; }}
+    .low {{ background: #E9F5F0; color: {RISK_LOW}; border: 1px solid {RISK_LOW}55; }}
+    .disclaimer {{ background: #FFF8E8; border: 1px solid #F0DFA6; border-radius: 8px; padding: 0.8rem; font-size: 0.86rem; color: #6B5A17; margin-top: 1.4rem; }}
     </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title("🩸 Anemia Screening & Risk Analytics Portal")
-st.markdown(
-    "Statistical risk screening built on **NFHS-5 data**, for frontline health "
-    "workers supporting India's Aspirational Districts."
-)
+""", unsafe_allow_html=True)
 
 # ==========================================================
-# 2. Model & Feature Checklist Loading (ALIGNED WITH PRODUCTION)
+# 1. Load Data & Models (Cached)
 # ==========================================================
+@st.cache_resource(show_spinner="Loading model & assets...")
+def load_assets():
+    json_path = MODELS_DIR / "xgboost_anemia_model.json"
+    pkl_matches = sorted(MODELS_DIR.glob("xgboost_anemia_optimized_*.pkl"))
+    feat_path = MODELS_DIR / "xgboost_features_v1_20260729.pkl"
+    
+    fallback_feats = ["state_code", "district_code", "age", "wealth_index_national", "wealth_index_state", 
+                      "education_level", "total_children_born", "is_pregnant", "freq_milk_curd", "freq_pulses_beans", 
+                      "freq_green_leafy_veg", "freq_fruits", "freq_eggs", "freq_fish", "freq_chicken_meat", 
+                      "freq_fried_food", "freq_aerated_drinks", "is_aspirational", "residence_type_1", "residence_type_2"] + \
+                     [f"religion_{i}" for i in range(1, 10)] + ["religion_96"] + [f"caste_ethnicity_{i}" for i in [1, 2, 3, 4, 8]] + \
+                     [f"marital_status_standard_{i}" for i in [0, 1, 3, 4, 5]] + [f"marital_status_state_{i}" for i in range(7)]
+    
+    feat_order = joblib.load(feat_path) if feat_path.exists() else fallback_feats
+    model, err = None, None
 
-# FIXED: Load the associated feature checklist to guarantee column shape
-FEATURE_CHECKLIST_PATH = REPO_ROOT / "models" / "xgboost_features_v1_20260729.pkl"
-
-if FEATURE_CHECKLIST_PATH.exists():
-    FALLBACK_FEATURE_ORDER = joblib.load(FEATURE_CHECKLIST_PATH)
-else:
-    # Safe fallback index if file hasn't moved yet (syntax fixed)
-    FALLBACK_FEATURE_ORDER = [
-        "state_code", "district_code", "age", "wealth_index_national", "wealth_index_state",
-        "education_level", "total_children_born", "is_pregnant", "freq_milk_curd",
-        "freq_pulses_beans", "freq_green_leafy_veg", "freq_fruits", "freq_eggs", "freq_fish",
-        "freq_chicken_meat", "freq_fried_food", "freq_aerated_drinks", "is_aspirational",
-        "residence_type_1", "residence_type_2"
-    ] + [f"religion_{i}" for i in range(1, 10)] + ["religion_96"] \
-      + [f"caste_ethnicity_{i}" for i in [1, 2, 3, 4, 8]] \
-      + [f"marital_status_standard_{i}" for i in [0, 1, 3, 4, 5]] \
-      + [f"marital_status_state_{i}" for i in range(0, 7)]
-
-
-@st.cache_resource(show_spinner="Loading production model...")
-def load_production_model():
-    """Returns (model, feature_order, error_message)."""
-    if JSON_MODEL_PATH.exists():
-        try:
-            m = xgb.XGBClassifier()
-            m.load_model(str(JSON_MODEL_PATH))
-            booster_features = m.get_booster().feature_names
-            feat_order = list(booster_features) if booster_features else FALLBACK_FEATURE_ORDER
-            return m, feat_order, None
-        except Exception as e:
-            json_error = f"Found {JSON_MODEL_PATH.name} but failed to load it: {e}"
-    else:
-        json_error = None
-
-    if PKL_MODEL_PATH is not None and PKL_MODEL_PATH.exists():
-        try:
-            m = joblib.load(PKL_MODEL_PATH)
-            try:
-                # Safely extract booster names if embedded, else default to our saved checklist file
-                feat_order = list(m.get_booster().feature_names) if m.get_booster().feature_names else FALLBACK_FEATURE_ORDER
-            except Exception:
-                feat_order = FALLBACK_FEATURE_ORDER
-            return m, feat_order, None
-        except Exception as e:
-            pkl_error = str(e)
-            combined = (json_error + "\n\n" if json_error else "") + f"Found {PKL_MODEL_PATH.name} but failed to load it: {pkl_error}"
-            return None, FALLBACK_FEATURE_ORDER, combined
-
-    return None, FALLBACK_FEATURE_ORDER, "No model file found."
-
-model, FEATURE_ORDER, load_error = load_production_model()
-
-if load_error:
-    st.error("⚠️ Could not load the production model.")
-    with st.expander("Show technical details"):
-        st.code(load_error)
-
-if not load_error and not FEATURE_CHECKLIST_PATH.exists():
-    st.info(
-        "ℹ️ Using the model's embedded/fallback feature order. Ensure "
-        "'xgboost_features_v1_20260729.pkl' is placed in your models directory "
-        "to guarantee column shape alignment."
-    )
-
-# ==========================================================
-# 2b. State / district name lookup
-# ==========================================================
-LOCATION_LOOKUP_PATH = APP_DIR / "state_district_lookup.csv"
-
-
-@st.cache_resource(show_spinner=False)
-def load_location_lookup():
-    if not LOCATION_LOOKUP_PATH.exists():
-        return {}, {}, {}, f"'{LOCATION_LOOKUP_PATH.name}' not found in:\n{APP_DIR}"
     try:
-        loc = pd.read_csv(LOCATION_LOOKUP_PATH)
-        state_to_districts = (
-            loc.sort_values("district_name")
-               .groupby("state_name")["district_name"]
-               .apply(list)
-               .to_dict()
-        )
-        code_lookup = {
-            (row.state_name, row.district_name): (int(row.state_code), int(row.district_code))
-            for row in loc.itertuples()
-        }
-        aspirational_lookup = {
-            (row.state_name, row.district_name): bool(row.is_aspirational)
-            for row in loc.itertuples()
-        }
-        return state_to_districts, code_lookup, aspirational_lookup, None
-    except Exception as e:
-        return {}, {}, {}, f"Failed to read '{LOCATION_LOOKUP_PATH.name}': {e}"
+        if json_path.exists():
+            model = xgb.XGBClassifier()
+            model.load_model(str(json_path))
+        elif pkl_matches:
+            model = joblib.load(pkl_matches[-1])
+        else: err = "No model found in the models/ directory."
+    except Exception as e: err = str(e)
+    
+    # Load Locations
+    loc_path = DATA_DIR / "state_district_lookup.csv"
+    st_dist, codes, asp = {}, {}, {}
+    if loc_path.exists():
+        loc = pd.read_csv(loc_path)
+        st_dist = loc.groupby("state_name")["district_name"].apply(list).to_dict()
+        codes = {(r.state_name, r.district_name): (r.state_code, r.district_code) for r in loc.itertuples()}
+        asp = {(r.state_name, r.district_name): bool(r.is_aspirational) for r in loc.itertuples()}
+    
+    return model, feat_order, err, st_dist, codes, asp, not loc_path.exists()
 
+model, FEATURE_ORDER, load_error, STATE_TO_DISTRICTS, CODES, ASPIRATIONAL, loc_err = load_assets()
 
-STATE_TO_DISTRICTS, LOCATION_CODE_LOOKUP, ASPIRATIONAL_LOOKUP, location_error = load_location_lookup()
-
-# ==========================================================
-# 3. Sidebar inputs (layman-friendly labels)
-# ==========================================================
-st.sidebar.header("📋 Patient Profile")
-age = st.sidebar.slider("Patient Age (Years)", min_value=15, max_value=49, value=28)
-is_pregnant = st.sidebar.selectbox("Is the patient currently pregnant?", ["No", "Yes"])
-total_children = st.sidebar.number_input("Total Children Born", min_value=0, max_value=15, value=1, step=1)
-
-st.sidebar.header("🏠 Socioeconomic & Location")
-
-if location_error:
-    st.sidebar.warning("⚠️ State/district list unavailable -- using a default location.")
-    with st.sidebar.expander("Show technical details"):
-        st.caption(location_error)
-    state_code, district_code = 10, 203
-    location_label = "Bihar (default -- district list unavailable)"
-    is_aspirational_flag = False
-else:
-    state_names = sorted(STATE_TO_DISTRICTS.keys())
-    default_state = "Bihar" if "Bihar" in state_names else state_names[0]
-    state_selected = st.sidebar.selectbox(
-        "State", state_names, index=state_names.index(default_state)
-    )
-    district_names = sorted(STATE_TO_DISTRICTS[state_selected])
-    default_district = "Pashchim Champaran" if "Pashchim Champaran" in district_names else district_names[0]
-    district_selected = st.sidebar.selectbox(
-        "District", district_names, index=district_names.index(default_district)
-    )
-    state_code, district_code = LOCATION_CODE_LOOKUP[(state_selected, district_selected)]
-    is_aspirational_flag = ASPIRATIONAL_LOOKUP.get((state_selected, district_selected), False)
-    location_label = f"{district_selected}, {state_selected}"
-
-is_aspirational = "Yes" if is_aspirational_flag else "No"
-st.sidebar.caption(
-    f"📍 Aspirational District status: **{is_aspirational}** "
-    "(auto-detected from the state/district selected above, per NITI Aayog's "
-    "112 Aspirational Districts list)."
-)
-
-residence = st.sidebar.selectbox("Type of Residence Area", ["Urban", "Rural"])
-wealth = st.sidebar.select_slider(
-    "Household Wealth Index Level",
-    options=["Poorest", "Poorer", "Middle", "Richer", "Richest"],
-    value="Middle",
-)
-education = st.sidebar.selectbox(
-    "Highest Education Completed",
-    ["No Education", "Primary School", "Secondary School", "Higher Secondary/College"],
-)
-
-st.sidebar.header("🥦 Dietary Consumption Frequencies")
-# FIXED: Maps directly to your optimized training scale 0 < 1 < 2 < 3
-diet_mapping = {
-    "Never": 0, 
-    "Occasional / Few times a week": 1, 
-    "Weekly": 2, 
-    "Daily": 3
-}
-diet_options = list(diet_mapping.keys())
-
-with st.sidebar.expander("Show all 9 dietary items", expanded=True):
-    freq_milk = st.selectbox("Milk / Curd frequency", diet_options, index=1)
-    freq_pulses = st.selectbox("Pulses / Beans frequency", diet_options, index=2)
-    freq_veg = st.selectbox("Green Leafy Vegetables frequency", diet_options, index=2)
-    freq_fruits = st.selectbox("Fruits frequency", diet_options, index=1)
-    freq_eggs = st.selectbox("Eggs frequency", diet_options, index=1)
-    freq_fish = st.selectbox("Fish frequency", diet_options, index=0)
-    freq_chicken = st.selectbox("Chicken / Meat frequency", diet_options, index=0)
-    freq_fried = st.selectbox("Fried Foods frequency", diet_options, index=1)
-    freq_drinks = st.selectbox("Aerated Carbonated Drinks frequency", diet_options, index=0)
-
-with st.sidebar.expander("🩺 Environment diagnostics"):
-    for pkg in ["streamlit", "xgboost", "scikit-learn", "pandas", "numpy", "shap", "plotly"]:
-        try:
-            st.caption(f"{pkg}: {_md.version(pkg)}")
-        except _md.PackageNotFoundError:
-            st.caption(f"{pkg}: not installed")
+def format_col(c):
+    """Shortened feature namer for cleaner SHAP charts"""
+    if c.startswith("freq_"): return c.replace("freq_", "").replace("_", " ").title()
+    for p, n in zip(["residence_", "religion_", "caste_", "marital_"], ["Residence", "Religion", "Caste", "Marital Status"]):
+        if c.startswith(p): return n
+    return {"age":"Age", "total_children_born":"Children", "is_pregnant":"Pregnant", "is_aspirational":"Aspirational Dist"}.get(c, c.replace("_", " ").title())
 
 # ==========================================================
-# 4. Feature engineering
+# 2. Sidebar Navigation & Links
 # ==========================================================
-wealth_map = {"Poorest": 1, "Poorer": 2, "Middle": 3, "Richer": 4, "Richest": 5}
-edu_map = {"No Education": 0, "Primary School": 1, "Secondary School": 2, "Higher Secondary/College": 3}
+st.sidebar.title("🩸 Navigation")
+page = st.sidebar.radio("Go to", ["📊 Project Overview & Insights", "🩺 Interactive Screening Tool", "🤖 AI Clinical Assistant (RAG)"])
 
-input_data = {
-    "state_code": state_code,
-    "district_code": district_code,
-    "age": age,
-    "wealth_index_national": wealth_map[wealth],
-    "wealth_index_state": wealth_map[wealth],
-    "education_level": edu_map[education],
-    "total_children_born": total_children,
-    "is_pregnant": 1 if is_pregnant == "Yes" else 0,
-    "freq_milk_curd": diet_mapping[freq_milk],
-    "freq_pulses_beans": diet_mapping[freq_pulses],
-    "freq_green_leafy_veg": diet_mapping[freq_veg],
-    "freq_fruits": diet_mapping[freq_fruits],
-    "freq_eggs": diet_mapping[freq_eggs],
-    "freq_fish": diet_mapping[freq_fish],
-    "freq_chicken_meat": diet_mapping[freq_chicken],
-    "freq_fried_food": diet_mapping[freq_fried],
-    "freq_aerated_drinks": diet_mapping[freq_drinks],
-    "is_aspirational": 1 if is_aspirational == "Yes" else 0,
-    "residence_type_1": 1 if residence == "Urban" else 0,
-    "residence_type_2": 1 if residence == "Rural" else 0,
-}
-for i in range(1, 10):
-    input_data[f"religion_{i}"] = 0
-input_data["religion_96"] = 0
-for i in [1, 2, 3, 4, 8]:
-    input_data[f"caste_ethnicity_{i}"] = 0
-for i in [0, 1, 3, 4, 5]:
-    input_data[f"marital_status_standard_{i}"] = 0
-for i in range(0, 7):
-    input_data[f"marital_status_state_{i}"] = 0
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔗 Project Links")
+st.sidebar.markdown("[GitHub Repository](https://github.com/Prathamyadav01/Anemia-Prediction)")
+st.sidebar.markdown("[Jupyter Notebook](https://github.com/Prathamyadav01/Anemia-Prediction/blob/main/notebook/Project_Best_Model_.ipynb)")
+st.sidebar.markdown("**Authors:** Pratham Yadav, Kushagra Sharma, Mayur Saini")
 
-df_features = pd.DataFrame([input_data]).reindex(columns=FEATURE_ORDER, fill_value=0)
-
-
-def group_of(col: str) -> str:
-    """Maps a raw model column name to a human-readable, grouped label."""
-    friendly = {
-        "age": "Age",
-        "total_children_born": "Number of Children Born",
-        "is_pregnant": "Currently Pregnant",
-        "wealth_index_national": "Household Wealth Index",
-        "wealth_index_state": "Household Wealth Index",
-        "education_level": "Education Level",
-        "is_aspirational": "Aspirational District Status",
-        "freq_milk_curd": "Diet: Milk / Curd",
-        "freq_pulses_beans": "Diet: Pulses / Beans",
-        "freq_green_leafy_veg": "Diet: Green Leafy Vegetables",
-        "freq_fruits": "Diet: Fruits",
-        "freq_eggs": "Diet: Eggs",
-        "freq_fish": "Diet: Fish",
-        "freq_chicken_meat": "Diet: Chicken / Meat",
-        "freq_fried_food": "Diet: Fried Foods",
-        "freq_aerated_drinks": "Diet: Aerated Drinks",
-        "state_code": "Geographic Code (State)",
-        "district_code": "Geographic Code (District)",
-    }
-    if col in friendly:
-        return friendly[col]
-    if col.startswith("residence_type_"):
-        return "Residence Area (Urban/Rural)"
-    if col.startswith("religion_"):
-        return "Religion"
-    if col.startswith("caste_ethnicity_"):
-        return "Caste / Ethnicity"
-    if col.startswith("marital_status_"):
-        return "Marital Status"
-    return col
+if load_error: st.sidebar.error(f"⚠️ Model load error: {load_error}")
 
 # ==========================================================
-# 5. Main interface
+# 3. Page 1: Project Overview & Insights
 # ==========================================================
-tab_predict, tab_insights, tab_about = st.tabs(
-    ["🎯 Risk Assessment", "📊 Model Insights", "ℹ️ About This Tool"]
-)
-
-# ---- Prediction (shared across tabs) ----
-prob_anemic, predict_error = None, None
-if model is not None:
-    try:
-        prob_anemic = float(model.predict_proba(df_features)[0, 1])
-    except Exception as e:
-        predict_error = str(e)
-
-THRESHOLD = 0.49
-
-with tab_predict:
-    if model is None:
-        st.warning("Fix the model loading error above before a prediction can be shown.")
-    elif predict_error or prob_anemic is None:
-        st.error("⚠️ The model loaded, but the prediction call failed.")
-        with st.expander("Show technical details"):
-            st.code(predict_error)
-    else:
-        col1, col2 = st.columns([1, 1])
-
-        with col1:
-            st.subheader("Diagnostic Evaluation Output")
-            fig_gauge = go.Figure(
-                go.Indicator(
-                    mode="gauge+number",
-                    value=prob_anemic * 100,
-                    number={"suffix": "%", "font": {"size": 42}},
-                    gauge={
-                        "axis": {"range": [0, 100]},
-                        "bar": {"color": RISK_HIGH if prob_anemic >= THRESHOLD else RISK_LOW},
-                        "steps": [
-                            {"range": [0, THRESHOLD * 100], "color": "#E9F5F0"},
-                            {"range": [THRESHOLD * 100, 100], "color": "#FBEAEA"},
-                        ],
-                        "threshold": {
-                            "line": {"color": "#333333", "width": 3},
-                            "thickness": 0.85,
-                            "value": THRESHOLD * 100,
-                        },
-                    },
-                )
-            )
-            fig_gauge.update_layout(height=260, margin=dict(l=20, r=20, t=30, b=10))
-            st.plotly_chart(fig_gauge, width='stretch')
-
-            if prob_anemic >= THRESHOLD:
-                st.markdown(
-                    '<div class="risk-banner high">🚨 POSITIVE SCREEN FOR ANEMIA RISK</div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    f"""
-                    **Clinical suggestion framework**
-                    - Score sits above the optimized intervention risk floor (**{THRESHOLD}**).
-                    - Recommended action: prioritize for hemoglobin verification (clinical blood test).
-                    """
-                )
-            else:
-                st.markdown(
-                    '<div class="risk-banner low">✅ LOW RISK PROFILE DETECTED</div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    """
-                    **Clinical suggestion framework**
-                    - Profile tracks under the active intervention threshold.
-                    - Recommended action: maintain routine preventive supplementation via local Anganwadi supply networks.
-                    """
-                )
-
-        with col2:
-            st.subheader("Patient Input Recap")
-            recap = pd.DataFrame(
-                {
-                    "Field": [
-                        "Location", "Age", "Pregnant", "Residence", "Wealth Index", "Education",
-                        "Children Born", "Aspirational District",
-                    ],
-                    "Value": [
-                        location_label, f"{age} yrs", is_pregnant, residence, wealth, education,
-                        str(total_children), is_aspirational,
-                    ],
-                }
-            )
-            st.dataframe(recap, hide_index=True, width='stretch')
-            with st.expander("Show full dietary inputs"):
-                diet_recap = pd.DataFrame(
-                    {
-                        "Item": ["Milk/Curd", "Pulses/Beans", "Green Leafy Veg", "Fruits",
-                                 "Eggs", "Fish", "Chicken/Meat", "Fried Food", "Aerated Drinks"],
-                        "Frequency": [freq_milk, freq_pulses, freq_veg, freq_fruits, freq_eggs,
-                                      freq_fish, freq_chicken, freq_fried, freq_drinks],
-                    }
-                )
-                st.dataframe(diet_recap, hide_index=True, width='stretch')
-
-        st.markdown(
-            '<div class="disclaimer">⚕️ This tool produces a statistical screening '
-            'estimate for triage/prioritization only. It is not a diagnosis. Confirm any '
-            'positive screen with a laboratory hemoglobin test before clinical action.</div>',
-            unsafe_allow_html=True,
-        )
-
-# ---- Tab 2: Model Insights ----
-with tab_insights:
-    st.subheader("What's driving this assessment?")
-
-    if model is None:
-        st.warning("Load the model successfully to see driver analysis.")
-    else:
-        @st.cache_resource(show_spinner=False)
-        def get_shap_explainer(_m):
-            import shap  # local import: optional dependency
-            return shap.TreeExplainer(_m)
-
-        grouped, kind = None, None
-        try:
-            explainer = get_shap_explainer(model)
-            raw_shap = explainer.shap_values(df_features)
-            if isinstance(raw_shap, list):
-                raw_shap = raw_shap[1] if len(raw_shap) > 1 else raw_shap[0]
-            raw_shap = np.asarray(raw_shap).reshape(-1)
-            contrib = pd.DataFrame({"raw_col": df_features.columns, "value": raw_shap})
-            contrib["group"] = contrib["raw_col"].apply(group_of)
-            grouped = contrib.groupby("group")["value"].sum().reset_index()
-            grouped["abs_value"] = grouped["value"].abs()
-            grouped = grouped.sort_values("abs_value", ascending=False).head(8).sort_values("value")
-            kind = "local"
-        except ImportError:
-            kind = None
-        except Exception:
-            kind = None
-
-        if kind is None:
+if page == "📊 Project Overview & Insights":
+    st.title("🩸 Predicting Anemia Risk in India")
+    
+    st.markdown("""
+    ### Executive Summary
+    Anemia is a silent epidemic impacting maternal and child health. Clinical blood tests are often expensive and logistically difficult to deploy in highly underdeveloped areas. 
+    
+    This project leverages **XGBoost** trained on harmonized **NFHS-5 data** to provide a purely socioeconomic and dietary screening tool for community health workers. By predicting the probability that a woman aged 15–49 is anemic (hemoglobin < 11.0 g/dL), we can triage and prioritize patients effectively without requiring a single drop of blood.
+    """)
+    st.markdown("---")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Model Performance")
+        st.markdown("""
+        **Survey-weighted held-out test metrics:**
+        *   **Cross-validated ROC-AUC:** 0.632
+        *   **Optimized Decision Threshold:** 0.49
+        *   **Methodology:** Categorical fields are explicitly one-hot encoded. The `is_aspirational` flag maps directly to NITI Aayog's 112 Aspirational Districts framework.
+        
+        *These numbers indicate modest, better-than-chance discrimination—ideal for flagging patients for clinical follow-ups.*
+        """)
+        
+    with col2:
+        st.subheader("🌍 Global Feature Importance")
+        st.markdown("What factors drive the model's decision-making across *all* patients?")
+        if model:
             try:
-                raw_scores = model.get_booster().get_score(importance_type="total_gain")
-                contrib = pd.DataFrame({"raw_col": list(raw_scores.keys()), "value": list(raw_scores.values())})
-                contrib["group"] = contrib["raw_col"].apply(group_of)
-                grouped = contrib.groupby("group")["value"].sum().reset_index()
-                grouped["value"] = grouped["value"] / grouped["value"].sum() * 100
-                grouped["abs_value"] = grouped["value"].abs()
-                grouped = grouped.sort_values("abs_value", ascending=False).head(8).sort_values("value")
-                kind = "global"
+                raw = model.get_booster().get_score(importance_type="total_gain")
+                df_glob = pd.DataFrame({"col": list(raw.keys()), "val": list(raw.values())})
+                df_glob["grp"] = df_glob["col"].apply(format_col)
+                grp_glob = df_glob.groupby("grp")["val"].sum().reset_index()
+                grp_glob["val"] = grp_glob["val"] / grp_glob["val"].sum() * 100
+                grp_glob = grp_glob.sort_values("val", ascending=True).tail(10)
+                
+                fig_g = go.Figure(go.Bar(x=grp_glob["val"], y=grp_glob["grp"], orientation="h", marker_color=PRIMARY))
+                fig_g.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Global Importance (%)")
+                st.plotly_chart(fig_g, use_container_width=True)
             except Exception:
-                grouped, kind = None, None
+                st.info("Global feature importance unavailable.")
 
-        if grouped is None or grouped.empty:
-            st.info("Feature-importance data isn't available for this model file.")
+# ==========================================================
+# 4. Page 2: Interactive Screening Tool
+# ==========================================================
+elif page == "🩺 Interactive Screening Tool":
+    st.title("📋 Patient Risk Screening Form")
+    st.markdown("Enter the patient's socio-demographic and dietary survey responses below for an instant risk assessment.")
+    
+    # 4a. Location Lookup (Kept outside the form so it updates dynamically)
+    st.subheader("📍 Geographic Location")
+    if loc_err or not STATE_TO_DISTRICTS:
+        st.warning("Location data missing; using defaults.")
+        st_code, dist_code, is_asp = 10, 203, False
+        loc_label = "Default Location"
+    else:
+        l_col1, l_col2, l_col3 = st.columns(3)
+        with l_col1: st_sel = st.selectbox("State", sorted(STATE_TO_DISTRICTS.keys()))
+        with l_col2: dist_sel = st.selectbox("District", sorted(STATE_TO_DISTRICTS[st_sel]))
+        
+        st_code, dist_code = CODES.get((st_sel, dist_sel), (0,0))
+        is_asp = ASPIRATIONAL.get((st_sel, dist_sel), False)
+        loc_label = f"{dist_sel}, {st_sel}"
+        
+        with l_col3:
+            st.markdown("<br>", unsafe_allow_html=True) # alignment spacer
+            st.caption(f"Aspirational District Status: **{'✅ Yes' if is_asp else '❌ No'}**")
+
+    # 4b. The Batched Form
+    with st.form("patient_form"):
+        st.subheader("👤 Socio-Demographic Data")
+        c1, c2, c3 = st.columns(3)
+        
+        with c1:
+            age = st.slider("Patient Age (Years)", 15, 49, 20)
+            residence = st.selectbox("Residence Type", ["Urban", "Rural"])
+        with c2:
+            is_preg = st.selectbox("Currently Pregnant?", ["No", "Yes"])
+            wealth = st.selectbox("Household Wealth Index", ["Poorest", "Poorer", "Middle", "Richer", "Richest"], index=2)
+        with c3:
+            children = st.number_input("Total Children Born", 0, 15, 0)
+            edu = st.selectbox("Highest Education", ["No Education", "Primary School", "Secondary School", "Higher Secondary/College"])
+
+        st.markdown("---")
+        st.subheader("🥦 Dietary Consumption Frequencies")
+        diet_opts = {"Never": 0, "Occasional": 1, "Weekly": 2, "Daily": 3}
+        
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            f_milk = st.selectbox("Milk or Curd", list(diet_opts.keys()), index=1)
+            f_pulses = st.selectbox("Pulses or Beans", list(diet_opts.keys()), index=2)
+            f_veg = st.selectbox("Dark Green Veg", list(diet_opts.keys()), index=2)
+        with d2:
+            f_fruits = st.selectbox("Fruits", list(diet_opts.keys()), index=1)
+            f_eggs = st.selectbox("Eggs", list(diet_opts.keys()), index=0)
+            f_fish = st.selectbox("Fish", list(diet_opts.keys()), index=0)
+        with d3:
+            f_meat = st.selectbox("Chicken or Meat", list(diet_opts.keys()), index=0)
+            f_fried = st.selectbox("Fried Food", list(diet_opts.keys()), index=1)
+            f_aerated = st.selectbox("Aerated Drinks", list(diet_opts.keys()), index=1)
+            
+        submit_button = st.form_submit_button("Analyze Patient Risk", use_container_width=True)
+
+    # 4c. Prediction Logic & Results
+    if submit_button:
+        if not model:
+            st.error("Cannot predict: Model failed to load.")
         else:
-            if kind == "local":
-                st.caption(
-                    "Shows how each factor pushed **this patient's** predicted risk up "
-                    "(red) or down (green), compared with an average patient in the "
-                    "training data — computed with SHAP."
-                )
-                colors = [RISK_HIGH if v > 0 else RISK_LOW for v in grouped["value"]]
-                x_title = "Impact on this patient's predicted risk"
-            else:
-                st.caption(
-                    "The `shap` package isn't installed, so this shows overall feature "
-                    "importance across *all* patients in the training data — not specific "
-                    "to this patient. Install `shap` (see requirements.txt) for a true "
-                    "per-patient explanation."
-                )
-                colors = [PRIMARY] * len(grouped)
-                x_title = "Share of total model importance (%)"
+            # Assemble Features
+            base_data = {
+                "state_code": st_code, "district_code": dist_code, "age": age, 
+                "wealth_index_national": ["Poorest", "Poorer", "Middle", "Richer", "Richest"].index(wealth)+1,
+                "wealth_index_state": ["Poorest", "Poorer", "Middle", "Richer", "Richest"].index(wealth)+1,
+                "education_level": ["No Education", "Primary School", "Secondary School", "Higher Secondary/College"].index(edu),
+                "total_children_born": children, "is_pregnant": 1 if is_preg=="Yes" else 0,
+                "is_aspirational": int(is_asp), "residence_type_1": int(residence=="Urban"), "residence_type_2": int(residence=="Rural"),
+                "freq_milk_curd": diet_opts[f_milk], "freq_pulses_beans": diet_opts[f_pulses], "freq_green_leafy_veg": diet_opts[f_veg],
+                "freq_fruits": diet_opts[f_fruits], "freq_eggs": diet_opts[f_eggs], "freq_fish": diet_opts[f_fish],
+                "freq_chicken_meat": diet_opts[f_meat], "freq_fried_food": diet_opts[f_fried], "freq_aerated_drinks": diet_opts[f_aerated]
+            }
+            df_features = pd.DataFrame([base_data]).reindex(columns=FEATURE_ORDER, fill_value=0)
+            
+            # Explicit Type Casting (Robustness Fix)
+            for col in df_features.columns:
+                df_features[col] = df_features[col].astype(float)
 
-            fig_bar = go.Figure(
-                go.Bar(x=grouped["value"], y=grouped["group"], orientation="h", marker_color=colors)
-            )
-            fig_bar.update_layout(
-                height=380,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title=x_title,
-                yaxis_title=None,
-                plot_bgcolor="white",
-            )
-            st.plotly_chart(fig_bar, width='stretch')
+            # Inference
+            THRESHOLD = 0.49
+            prob = float(model.predict_proba(df_features)[0,1])
+            
+            st.markdown("---")
+            st.subheader("🎯 Diagnostic Evaluation Output")
+            
+            r_col1, r_col2 = st.columns([1, 1.2])
+            
+            with r_col1:
+                fig = go.Figure(go.Indicator(mode="gauge+number", value=prob*100, number={"suffix":"%"}, gauge={
+                    "axis": {"range": [0,100]}, "bar": {"color": RISK_HIGH if prob>=THRESHOLD else RISK_LOW},
+                    "steps": [{"range": [0, THRESHOLD*100], "color": "#E9F5F0"}, {"range": [THRESHOLD*100, 100], "color": "#FBEAEA"}],
+                    "threshold": {"line": {"color": "#333", "width": 3}, "value": THRESHOLD*100}}))
+                fig.update_layout(height=280, margin=dict(l=20, r=20, t=30, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+                
+                if prob >= THRESHOLD:
+                    st.markdown(f'<div class="risk-banner high">🚨 POSITIVE SCREEN DETECTED</div>', unsafe_allow_html=True)
+                    st.caption(f"Score sits above the intervention risk floor ({THRESHOLD}). Prioritize for clinical blood test verification.")
+                else:
+                    st.markdown('<div class="risk-banner low">✅ LOW RISK DETECTED</div>', unsafe_allow_html=True)
+                    st.caption("Tracks under intervention threshold. Maintain routine preventive supplementation.")
+                    
+            with r_col2:
+                st.markdown("##### 🧬 What drove this patient's score?")
+                try:
+                    import shap
+                    sv = shap.TreeExplainer(model).shap_values(df_features)
+                    sv = sv[1] if isinstance(sv, list) and len(sv)>1 else (sv[0] if isinstance(sv, list) else sv)
+                    df_shap = pd.DataFrame({"col": df_features.columns, "val": np.asarray(sv).reshape(-1)})
+                    df_shap["grp"] = df_shap["col"].apply(format_col)
+                    grp_shap = df_shap.groupby("grp")["val"].sum().reset_index()
+                    grp_shap = grp_shap.reindex(grp_shap["val"].abs().sort_values(ascending=False).head(7).index).sort_values("val")
+                    
+                    fig_s = go.Figure(go.Bar(x=grp_shap["val"], y=grp_shap["grp"], orientation="h", 
+                                             marker_color=[RISK_HIGH if v>0 else RISK_LOW for v in grp_shap["val"]]))
+                    fig_s.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10), title="SHAP Values (Red = Pushed Risk Up, Green = Pushed Down)")
+                    st.plotly_chart(fig_s, use_container_width=True)
+                except Exception: 
+                    st.info("Install `shap` library to see patient-specific driver analysis.")
+            
+            st.markdown('<div class="disclaimer">⚕️ This tool produces a statistical screening estimate for triage/prioritization only. It is not a diagnosis. Confirm any positive screen with a laboratory hemoglobin test before clinical action.</div>', unsafe_allow_html=True)
 
-        st.markdown(
-            "> ⚠️ **Modeling caveat:** the state/district codes are numeric NFHS "
-            "administrative IDs, but the tree model treats them as ordinary numeric "
-            "values rather than pure categories. In testing, `district_code` alone can "
-            "carry as much weight as age or district status — worth revisiting (e.g. "
-            "target-encoding or one-hot-encoding geography) in a future model iteration."
+# ==========================================================
+# 5. Page 3: AI Clinical Assistant (RAG)
+# ==========================================================
+elif page == "🤖 AI Clinical Assistant (RAG)":
+    st.title("🤖 Anemia Mukt Bharat Clinical Guidelines Assistant")
+    st.caption("Ask questions about IFA dosages, referral protocols, or age-specific treatments.")
+
+    @st.cache_resource(show_spinner="Loading knowledge base...")
+    def init_rag_chain():
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-3.5-flash",
+            temperature=0.2,
+            api_key=st.secrets["GOOGLE_API_KEY"]
         )
 
-# ---- Tab 3: About ----
-with tab_about:
-    st.subheader("About this screening tool")
-    st.markdown(
-        """
-        This portal serves a **XGBoost classifier** trained on harmonized **NFHS-5**
-        (National Family Health Survey) individual-level records, predicting the
-        probability that a woman aged 15–49 is anemic (hemoglobin < 11.0 g/dL).
+        system_prompt = (
+            "You are an expert clinical assistant for community health workers (ASHAs) in India.\n"
+            "Use the provided context from official health guidelines to answer the user's question.\n"
+            "If you do not know the answer based on the text, state clearly that the guidelines do not mention it.\n"
+            "Keep your response concise, clear, and actionable.\n\n"
+            "Context:\n{context}"
+        )
 
-        **Reported model performance** (survey-weighted, held-out test set, from the
-        training notebook):
-        - Cross-validated ROC-AUC: **0.632**
-        - Decision threshold: **0.49** (chosen to maximize weighted macro F1)
-        - Weighted macro F1 at that threshold: **0.59** (precision/recall around 0.54–0.64
-          depending on class)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "{input}"),
+        ])
 
-        These numbers indicate **modest, better-than-chance discrimination** — appropriate
-        for flagging patients for follow-up testing, but not strong enough to stand in for
-        a laboratory diagnosis.
-        """
-    )
-    st.markdown(
-        """
-        **Data & methodology**
-        - Source: NFHS-5 (2019–21) individual recode, restricted to women aged 15–49.
-        - Target: binary anemia flag derived from measured hemoglobin level.
-        - `is_aspirational` flags NITI Aayog's 112 Aspirational Districts by district code.
-        - Categorical fields (religion, caste/ethnicity, marital status, residence) are
-          one-hot encoded to match the 47 columns the model was trained on.
-        """
-    )
-    st.caption(
-        "This is an academic/demo project and screening aid — not an officially "
-        "deployed NITI Aayog system."
-    )
+        question_answer_chain = create_stuff_documents_chain(llm, prompt)
+        return create_retrieval_chain(retriever, question_answer_chain)
+
+    rag_chain = init_rag_chain()
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if user_query := st.chat_input("e.g., What is the protocol for a teenager with severe anemia?"):
+        st.chat_message("user").markdown(user_query)
+        st.session_state.messages.append({"role": "user", "content": user_query})
+
+        with st.chat_message("assistant"):
+            with st.spinner("Searching official guidelines..."):
+                response = rag_chain.invoke({"input": user_query})
+                answer = response["answer"]
+                st.markdown(answer)
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
