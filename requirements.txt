@@ -1,5 +1,6 @@
 # Core app
 streamlit>=1.50
+starlette<1.0
 pandas>=2.0
 numpy>=1.24
 joblib>=1.3
@@ -16,6 +17,7 @@ plotly>=5.20
 # Model Insights tab. If not installed, the app automatically falls
 # back to global feature importance instead of crashing.
 shap>=0.44
+llvmlite>=0.44
 
 # RAG Clinical Assistant (Tab 3)
 langchain-core>=1.5
