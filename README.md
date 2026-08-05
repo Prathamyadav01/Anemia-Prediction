@@ -3,7 +3,7 @@
 A machine learning project using **NFHS-4** and **NFHS-5** (National Family Health Survey) data to analyze and predict district-level "Aspirational District" status, as defined under the **NITI Aayog Aspirational Districts Programme**. Includes a trained model, a Streamlit web app with an AI clinical assistant (RAG chatbot), and a Tableau dashboard.
 
 ## 🔗 Links
-- **App (if deployed):** [add your deployed app link here]
+- **App:** [Link](https://anemia-prediction-yj52tfhnzhca6q8gshgg6x.streamlit.app)
 - **Tableau Public Dashboard:** [NFHS-5 Predictive Anemia Vulnerability Dashboard](https://public.tableau.com/views/NFHS-5PredictiveAnemiaVulnerabilityDashboard/NFHS-5PredictiveAnemiaVulnerabilityDashboard?:language=en-GB&publish=yes&:sid=&:redirect=auth&:display_count=n&:origin=viz_share_link)
 
 ## 📁 Repository Structure
