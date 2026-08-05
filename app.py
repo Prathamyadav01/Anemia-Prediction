@@ -66,7 +66,7 @@ def load_assets():
     except Exception as e: err = str(e)
     
     # Load Locations
-    loc_path = DATA_DIR / "state_district_lookup.csv"
+    loc_path = DATA_DIR / "state_district.csv"
     st_dist, codes, asp = {}, {}, {}
     if loc_path.exists():
         loc = pd.read_csv(loc_path)
